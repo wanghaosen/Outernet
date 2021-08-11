@@ -29,10 +29,12 @@ with rosbag.Bag('output.bag', 'w') as bag:
         imu_msg.linear_acceleration.z = df['acc_z'][row] * 0.00239257812
 
         imu_msg.orientation.x = df['motor'][row] * 0.00024868693 * 3.1415926
-        #imu_msg.orientation.y = (df['servo'][row] - 17500) * 0.00008726646 + 0.096
+        #imu_msg.orientation.y = (df['servo'][row] - 17500) * 0.00008726646 + 0.096 
         #imu_msg.orientation.y = 26 * 3.1415926/180 * math.sin((df['servo'][row] - 17500) / 68.553)
-        imu_msg.orientation.y = 27.446 * math.sin((df['servo'][row] - 17500) * 3.1415926 / 180 / 84.13) * 3.1415926 / 180 + 0.105
-        imu_msg.orientation.z = (df['servo'][row] - 17500) * 26 * 3.1415926 / 180 / 6000 + 0.077
+        #imu_msg.orientation.y = 27.446 * math.sin((df['servo'][row] - 17500) * 3.1415926 / 180 / 84.13) * 3.1415926 / 180 + 0.105
+        #imu_msg.orientation.z = (df['servo'][row] - 17500) * 26 * 3.1415926 / 180 / 6000 + 0.077
+        imu_msg.orientation.y = 27.446 * math.sin((df['servo'][row] - 17500) * 3.1415926 / 180 / 84.13) * 3.1415926 / 180
+        imu_msg.orientation.z = (df['servo'][row] - 17500) * 26 * 3.1415926 / 180 / 6000
          
 
         bag.write("/CAN_SIGNALS", imu_msg, now)

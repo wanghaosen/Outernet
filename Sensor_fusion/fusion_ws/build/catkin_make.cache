@@ -1,0 +1,2 @@
+sensor_fusion
+-DCATKIN_DEVEL_PREFIX=/home/xinkaiz/Outernet/Sensor_fusion/fusion_ws/devel -DCMAKE_INSTALL_PREFIX=/home/xinkaiz/Outernet/Sensor_fusion/fusion_ws/install -G Unix Makefiles

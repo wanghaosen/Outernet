@@ -8,6 +8,7 @@
 #include <geometry_msgs/Vector3.h>
 #include <sensor_msgs/Imu.h>
 #include <nav_msgs/Odometry.h>
+#include <ecl/geometry/angle.hpp>
 
 #define ROS_NODE_NAME "sensor_fusion"
 
@@ -19,25 +20,29 @@ float servo_angle = 0; // for the inertia element approximation for the servo an
 double imu_x = 0;
 double imu_y = 0;
 double imu_z = 0;
-double imu_vx = 0;
-double imu_vy = 0;
-double imu_vz = 0;
-double imu_yaw = 0;
-double imu_roll = 0;
-double imu_pitch = 0;
-
-Eigen::Quaternionf imu_q_eig;
+Eigen::Quaternionf imu_q;
 Eigen::Vector3f imu_pos = Eigen::Vector3f::Zero();
 Eigen::Vector3f imu_vel = Eigen::Vector3f::Zero();
 Eigen::Vector3f imu_ang = Eigen::Vector3f::Zero();
+Eigen::Vector3f imu_lin_acc_last = Eigen::Vector3f::Zero();
+Eigen::Vector3f imu_ang_vel_last = Eigen::Vector3f::Zero();
 
-
+Eigen::Quaternionf kalman_q;
+Eigen::Vector3f kalman_pos = Eigen::Vector3f::Zero();
+Eigen::Vector3f kalman_vel = Eigen::Vector3f::Zero();
+Eigen::Vector3f kalman_ang = Eigen::Vector3f::Zero();
+Eigen::Vector3f kalman_lin_acc_last = Eigen::Vector3f::Zero();
+Eigen::Vector3f kalman_ang_vel_last = Eigen::Vector3f::Zero();
 
 float kalman_x = 0;
 float kalman_y = 0;
 float kalman_x_last = 0;
 float kalman_y_last = 0;
-float kalman_yaw = 3.14159265358979323846/2;
+float kalman_roll = 0;
+float kalman_pitch = 0;
+float kalman_yaw = 0;
+float kalman_yaw_last = 0;
+float servo_angle_kf = 0;
 
 float del_t = 0.01;
 
@@ -62,6 +67,14 @@ Eigen::Matrix<double, 3, 3> I3x3;
 
 Eigen::MatrixXd innov;
 
+void makeQuaternionFromVector( Eigen::Vector3f& inVec, Eigen::Quaternionf& outQuat )
+{
+    float phi = inVec.norm();
+    Eigen::Vector3f u = inVec / phi; // u is a unit vector
+
+    outQuat.vec() = u * sin( phi / 2.0 );
+    outQuat.w()   =     cos( phi / 2.0 );
+}
 
 void initEstimatorSystem()
 {
@@ -72,262 +85,89 @@ void initEstimatorSystem()
                  0.0, 1.0, 0.0,
                  0.0, 0.0, 1.0;
                  
-//If Q is too high, the KF will tend to use more of the (noisy) measurement. Otherwise KF will put more weight in the process and less in the measurement, then the result might drift away.
+// If Q is too high, the KF will tend to use more of the (noisy) measurement. Otherwise KF will put more weight in the process and less in the measurement, then the result might drift away.
+// Use IMU as prediction step. The x_y prediction is noisy, so put large number there. 
+// Seems that large numbers mean we trust IMU more. 
   proc_noise_Q << 1.0, 0.0, 0.0,
                   0.0, 1.0, 0.0,
-                  0.0, 0.0, 1.0;
+                  0.0, 0.0, 100.0;
+
+  // proc_noise_Q << 0.0, 0.0, 0.0,
+  //                 0.0, 0.0, 0.0,
+  //                 0.0, 0.0, 0.0;
                   
-//  If R is high, the filter will respond slowly as it is trusting new measurement less, if R is low, we trust the measurement more, the value might be noisy                 
-  meas_noise_R << 1.0, 0.0, 0.0,
-                  0.0, 1.0, 0.0,
-                  0.0, 0.0, 5.0;
+// If R is high, the filter will respond slowly as it is trusting new measurement less, if R is low, we trust the measurement more, the value might be noisy                 
+// Use odometry as measurement step.   
+  meas_noise_R << 100.0, 0.0, 0.0,
+                  0.0, 100.0, 0.0,
+                  0.0, 0.0, 1.0;
+
+  // meas_noise_R << 0.0, 0.0, 0.0,
+  //                 0.0, 0.0, 0.0,
+  //                 0.0, 0.0, 0.0;
 
   best_estimate << kalman_x, kalman_y, kalman_yaw;       
 
 // Initilize the rotation quaternion
-  imu_q_eig.vec() = Eigen::Vector3f::Zero();
-  imu_q_eig.w() = 1.0f;        
+  imu_q = Eigen::AngleAxisf(0.0, Eigen::Vector3f::UnitX()) * Eigen::AngleAxisf(0.0, Eigen::Vector3f::UnitY()) * Eigen::AngleAxisf(0.0, Eigen::Vector3f::UnitZ());     
+  kalman_q = Eigen::AngleAxisf(0.0, Eigen::Vector3f::UnitX()) * Eigen::AngleAxisf(0.0, Eigen::Vector3f::UnitY()) * Eigen::AngleAxisf(0.0, Eigen::Vector3f::UnitZ());     
 }
-
 
 void CANCallback( const sensor_msgs::Imu::ConstPtr &msg )
 {  
-  // Pure IMU 
-  double body_ax = - msg -> linear_acceleration.x;
-  double body_ay = msg -> linear_acceleration.y;
-  double body_az = - msg -> linear_acceleration.z;
-
-  double body_roll_rate = msg -> angular_velocity.y;
-  double body_pitch_rate = - msg -> angular_velocity.x;
-  double body_yaw_rate = - msg -> angular_velocity.z;
-
-
-  /********************* Approach 1 ***************************/
-  // double imu_ax = body_ax * cos(imu_yaw) - body_ay * sin(imu_yaw);
-  // double imu_ay = body_ax * sin(imu_yaw) + body_ay * cos(imu_yaw);
-
-  // imu_yaw += body_yaw_rate * del_t;
-  // imu_pitch += body_pitch_rate * del_t;
-  // imu_roll += body_roll_rate * del_t;
-  /************************************************************/
-
-  /********************* Approach 2 ***************************/
-  // Eigen::Matrix<double, 3, 3> rot_yaw;
-  // rot_yaw << cos(imu_yaw), -sin(imu_yaw), 0.0,
-  //            sin(imu_yaw), cos(imu_yaw), 0.0,
-  //            0.0, 0.0, 1.0; 
-
-  // Eigen::Matrix<double, 3, 3> rot_pitch;
-  // rot_pitch << 1.0, 0.0, 0.0,
-  //            0.0, cos(imu_pitch), -sin(imu_pitch),
-  //            0.0, sin(imu_pitch), cos(imu_pitch);
-
-  // Eigen::Matrix<double, 3, 3> rot_roll;
-  // rot_roll << cos(imu_roll), 0.0, sin(imu_roll),
-  //            0.0, 1.0, 0.0,
-  //            -sin(imu_roll), 0.0, cos(imu_roll);
-
-
-  // Eigen::Matrix<double, 3, 1> body_acc;
-  // body_acc << body_ax, body_ay, body_az;
-  // Eigen::Matrix<double, 3, 1> global_acc;
-
-  // global_acc = rot_yaw*rot_pitch*rot_roll*body_acc;
-
-  // double imu_ax = global_acc(0);
-  // double imu_ay = global_acc(1);
-
-  // imu_yaw += body_yaw_rate * del_t;
-  // imu_pitch += body_pitch_rate * del_t;
-  // imu_roll += body_roll_rate * del_t;
-  /************************************************************/
-
-  /********************* Approach 3 ***************************/
-//   tf::Quaternion imu_q, q_rot;
-//   imu_q.setRPY(imu_roll, imu_pitch, imu_yaw);
-//   imu_q.normalize(); 
-//   tf::Matrix3x3 rotation(imu_q);
-
-//   //////// Using quaternion rotation matrices /////////
-//   tf::Vector3 body;
-//   body.setValue(body_ax, body_ay, body_az);
-//   tf::Vector3 global;
-//   global = rotation*body;
-
-//   double imu_ax_1 = global.getX();
-//   double imu_ay_1 = global.getY();
-//   double imu_az_1 = global.getZ();
-
-//   /////////// Using rpy angles ///////////////////
-//   // Eigen::Matrix<double, 3, 1> body_acc;
-//   // body_acc << body_ax, body_ay, body_az;
-//   // Eigen::Matrix<double, 3, 1> global_acc;
-//   // Eigen::Matrix<double, 3, 3> rot_roll, rot_pitch, rot_yaw;
-
-//   // rot_yaw << cos(imu_yaw), -sin(imu_yaw), 0.0,
-//   //            sin(imu_yaw), cos(imu_yaw), 0.0,
-//   //            0.0, 0.0, 1.0; 
-
-//   // rot_pitch << 1.0, 0.0, 0.0,
-//   //            0.0, cos(imu_pitch), -sin(imu_pitch),
-//   //            0.0, sin(imu_pitch), cos(imu_pitch);
-
-//   // rot_roll << cos(imu_roll), 0.0, sin(imu_roll),
-//   //            0.0, 1.0, 0.0,
-//   //            -sin(imu_roll), 0.0, cos(imu_roll);
-
-//   // global_acc = rot_yaw*rot_pitch*rot_roll*body_acc;
-
-//   // // double imu_ax = global_acc(0);
-//   // // double imu_ay = global_acc(1);
-//   // // double imu_az = global_acc(2);
-
-//   double rot_r_1 = body_roll_rate * del_t;
-//   double rot_p_1 = body_pitch_rate * del_t;
-//   double rot_y_1 = body_yaw_rate * del_t;
-
-//   q_rot.setRPY(rot_r_1, rot_p_1, rot_y_1);
-//   q_rot.normalize();
-//   imu_q = q_rot * imu_q; //////////////////////////////// What is the right order? 
-//   imu_q.normalize();
-
-//   tf::Matrix3x3 new_angle(imu_q);
-//   new_angle.getRPY(imu_roll, imu_pitch, imu_yaw);
-
-// /************************************************************/
-
-//   /////////// Using Eigen ///////////////////
-//   Eigen::Vector3f global_acc, body_acc; ///< Position
-
-//   body_acc(0) = body_ax;
-//   body_acc(1) = body_ay;
-//   body_acc(2) = body_az;
-
-//   Eigen::Matrix3f R = imu_q_eig.toRotationMatrix();
-
-//   global_acc = R * body_acc;
-
-//   double imu_ax = global_acc(0);
-//   double imu_ay = global_acc(1);
-
-//   double rot_r = body_roll_rate * del_t;
-//   double rot_p = body_pitch_rate * del_t;
-//   double rot_y = body_yaw_rate * del_t;
-
-//   Eigen::Vector3f delta_rot;
-//   delta_rot(0) =  rot_r;
-//   delta_rot(1) =  rot_p;
-//   delta_rot(2) =  rot_y;
-
-//   Eigen::Quaternionf q_rot_eig; ///< Quaternion
-//   // makeQuaternionFromVector( delta_rot, q_rot);
-//   float phi = delta_rot.norm();
-//   Eigen::Vector3f u = delta_rot / phi; // u is a unit vector
-//   q_rot_eig.vec() = u * sin( phi / 2.0 );
-//   q_rot_eig.w()   =     cos( phi / 2.0 );
-
-//   imu_q_eig =  imu_q_eig * (q_rot_eig);   //////////////////////////////// Right order? 
-
-//   std::cout << "DIFF: " << imu_ax - imu_ax_1 << " " << imu_ay - imu_ay_1 << std::endl;
-  
-//   //////////////////////////////////////////////
-
-
-//   imu_x += imu_vx * del_t + 0.5 * imu_ax * del_t * del_t;
-//   imu_y += imu_vy * del_t + 0.5 * imu_ay * del_t * del_t;
-
-//   imu_vx += imu_ax * del_t;
-//   imu_vy += imu_ay * del_t;
-
-//   nav_msgs::Odometry pure_imu;
-//   pure_imu.header.frame_id = "map";
-//   pure_imu.pose.pose.position.x = imu_x;
-//   pure_imu.pose.pose.position.y = imu_y;
-  
-//   geometry_msgs::Quaternion q;
-//   // q = tf::createQuaternionMsgFromRollPitchYaw(imu_roll, imu_pitch, imu_yaw);
-//   // pure_imu.pose.pose.orientation = q;
-
-//   pure_imu.pose.pose.orientation.w = imu_q_eig.w();
-//   pure_imu.pose.pose.orientation.x = imu_q_eig.x();
-//   pure_imu.pose.pose.orientation.y = imu_q_eig.y();
-//   pure_imu.pose.pose.orientation.z = imu_q_eig.z();
-  
-//   imu_pos_pub_.publish(pure_imu);
-
-  double imu_ax, imu_ay, imu_az, imu_vx, imu_vy, imu_vz, imu_x, imu_y, imu_z;
-
-
+  /******************* Pure IMU **************************/
+  float imu_filter_param = 1.0;
   Eigen::Vector3f imu_lin_acc, imu_ang_vel;
-  imu_lin_acc(0) = msg -> linear_acceleration.x;
+  imu_lin_acc(0) = -msg -> linear_acceleration.x;
   imu_lin_acc(1) = msg -> linear_acceleration.y;
-  imu_lin_acc(2) = msg -> linear_acceleration.z;
-  imu_ang_vel(0) = msg -> angular_velocity.x;
+  imu_lin_acc(2) = -msg -> linear_acceleration.z;
+  imu_ang_vel(0) = -msg -> angular_velocity.x;
   imu_ang_vel(1) = msg -> angular_velocity.y;
-  imu_ang_vel(2) = msg -> angular_velocity.z;
+  imu_ang_vel(2) = -msg -> angular_velocity.z;
   
   Eigen::Vector3f gravity = Eigen::Vector3f::Zero();
-
-  Eigen::Matrix3f R = imu_q_eig.toRotationMatrix();
-
+  Eigen::Matrix3f R = imu_q.toRotationMatrix();
+  Eigen::Vector3f acc_proj_last = R*imu_lin_acc_last + gravity;
   Eigen::Vector3f acc_projection = R*imu_lin_acc + gravity;
-
-  acc_projection(2) = 0.0;
+  acc_projection = imu_filter_param * acc_projection + (1 - imu_filter_param) * acc_proj_last;
+  acc_projection(2) = 0.0; // force the z axis acceleration to 0
 
   imu_pos += imu_vel*del_t + 0.5*acc_projection*del_t*del_t;
   imu_vel += acc_projection*del_t;
 
+  Eigen::Quaternionf q_rot;
+  Eigen::Vector3f imu_ang = (imu_filter_param * imu_ang_vel + (1 - imu_filter_param) * imu_ang_vel_last) * del_t;
+  // makeQuaternionFromVector(imu_ang, q_rot);
+  q_rot = Eigen::AngleAxisf(imu_ang(0), Eigen::Vector3f::UnitX()) * Eigen::AngleAxisf(imu_ang(1), Eigen::Vector3f::UnitY()) * Eigen::AngleAxisf(imu_ang(2), Eigen::Vector3f::UnitZ());
+  imu_q =  imu_q * (q_rot); 
 
+  auto euler = imu_q.toRotationMatrix().eulerAngles(0, 1, 2);
+  // std::cout << "Euler from quaternion in roll, pitch, yaw"<< std::endl << euler << std::endl;
 
-  Eigen::Vector3f imu_ang = imu_ang_vel * del_t;
-
-  Eigen::Quaternionf q_rot_eig; ///< Quaternion
-  float phi = imu_ang.norm();
-  Eigen::Vector3f u = imu_ang / phi; // u is a unit vector
-  q_rot_eig.vec() = u * sin( phi / 2.0 );
-  q_rot_eig.w()   =     cos( phi / 2.0 );
-
-  imu_q_eig =  imu_q_eig * (q_rot_eig); 
+  imu_lin_acc_last = imu_lin_acc;
+  imu_ang_vel_last = imu_ang_vel;
 
   nav_msgs::Odometry pure_imu;
   pure_imu.header.frame_id = "map";
-  pure_imu.pose.pose.position.x = - imu_pos(0);
+  pure_imu.pose.pose.position.x = imu_pos(0);
   pure_imu.pose.pose.position.y = imu_pos(1);
   
-  geometry_msgs::Quaternion q;
-
-  Eigen::Vector3f imu_2_car;
-  imu_2_car(0) = 0.0; 
-  imu_2_car(1) = 3.1415926;  //3.1415926;
-  imu_2_car(2) = 0.0;
-
-  Eigen::Quaternionf q_imu_car; ///< Quaternion
-  phi = imu_2_car.norm();
-  u = imu_2_car / phi; // u is a unit vector
-  q_imu_car.vec() = u * sin( phi / 2.0 );
-  q_imu_car.w()   =     cos( phi / 2.0 );
-
-  Eigen::Quaternionf q_car = imu_q_eig*q_imu_car;
-
-  pure_imu.pose.pose.orientation.w = q_car.w();
-  pure_imu.pose.pose.orientation.x = q_car.x();
-  pure_imu.pose.pose.orientation.y = q_car.y();
-  pure_imu.pose.pose.orientation.z = q_car.z();
+  pure_imu.pose.pose.orientation.w = imu_q.w();
+  pure_imu.pose.pose.orientation.x = imu_q.x();
+  pure_imu.pose.pose.orientation.y = imu_q.y();
+  pure_imu.pose.pose.orientation.z = imu_q.z();
   
   imu_pos_pub_.publish(pure_imu);
 
 
 
-
-  // Pure odometry
+  /******************* Pure Odometry **************************/
   float car_speed = msg -> orientation.x;
   float servo_angle_raw = msg -> orientation.y;
-  // servo_angle_raw =  - 26 * sin((servo_angle_raw - 17500)*3.1415926/180/68.553) * 3.1415926/180;
-  // servo_angle_raw =   (servo_angle_raw - 17500)*7.56e-5;
   float filter_param = 0.01;
 
   servo_angle = (1 - filter_param) * servo_angle + filter_param * servo_angle_raw;
-  //servo_angle = 0.62 * servo_angle_raw;  // 0.867
+  // servo_angle = 0.62 * servo_angle_raw;  // 0.867
 
   float wheel_base = 0.257; // in meters
 
@@ -335,15 +175,14 @@ void CANCallback( const sensor_msgs::Imu::ConstPtr &msg )
   odometry_y += car_speed * cos(odometry_yaw) * del_t;
   
   odometry_yaw += car_speed * tan(servo_angle) * del_t / wheel_base;
-
-  // std::cout << "ODOM POSE: " << odometry_x << "," << odometry_y << ", " << odometry_yaw << std::endl;
   
   nav_msgs::Odometry pure_odometry;
   pure_odometry.header.frame_id = "map";
   pure_odometry.pose.pose.position.x = odometry_x;
   pure_odometry.pose.pose.position.y = odometry_y;
   pure_odometry.pose.pose.position.z = 0.0;
-
+  
+  geometry_msgs::Quaternion q;
   q = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, odometry_yaw);
   pure_odometry.pose.pose.orientation = q;
 
@@ -353,33 +192,65 @@ void CANCallback( const sensor_msgs::Imu::ConstPtr &msg )
 
   odometry_pos_pub_.publish(pure_odometry);
 
-  // EKF
+
+
+  /******************* EKF **************************/
   // step 1: prediction
-  sys_A << 0.0, 0.0, -car_speed * sin(kalman_yaw),
-           0.0, 0.0, car_speed * cos(kalman_yaw),
+  // propogate states using imu, and use the results as measurements
+
+  float param_imu = 1.0;
+  Eigen::Vector3f imu_lin_acc_kf, imu_ang_vel_kf;
+  imu_lin_acc_kf(0) = -msg -> linear_acceleration.x;
+  imu_lin_acc_kf(1) = msg -> linear_acceleration.y;
+  imu_lin_acc_kf(2) = -msg -> linear_acceleration.z;
+  imu_ang_vel_kf(0) = -msg -> angular_velocity.x;
+  imu_ang_vel_kf(1) = msg -> angular_velocity.y;
+  imu_ang_vel_kf(2) = -msg -> angular_velocity.z - 0.00053263221*0;
+  
+  Eigen::Matrix3f R_kf = kalman_q.toRotationMatrix();
+  Eigen::Vector3f acc_proj_last_kf = R_kf*kalman_lin_acc_last;
+  Eigen::Vector3f acc_projection_kf = R_kf*imu_lin_acc_kf;
+  acc_projection_kf = param_imu * acc_projection_kf + (1 - param_imu) * acc_proj_last_kf;
+
+  float imu_vx_est = (kalman_x - kalman_x_last) / del_t;
+  float imu_vy_est = (kalman_y - kalman_y_last) / del_t;
+  float imu_x_est = kalman_x + imu_vx_est * del_t + 0.5 * (acc_projection_kf(0)) * del_t * del_t;
+  float imu_y_est = kalman_y + imu_vy_est * del_t + 0.5 * acc_projection_kf(1) * del_t * del_t;
+
+
+  Eigen::Quaternionf q_rot_kf;
+  Eigen::Vector3f imu_ang_kf = (param_imu * imu_ang_vel_kf + (1 - param_imu) * kalman_ang_vel_last) * del_t;
+  float imu_yaw_est = kalman_yaw + imu_ang_kf(2);
+
+  kalman_x_last = kalman_x;
+  kalman_y_last = kalman_y;
+
+  kalman_lin_acc_last = imu_lin_acc_kf;
+  kalman_ang_vel_last = imu_ang_vel_kf;
+
+  float car_speed_kf = msg -> orientation.x;
+  float servo_angle_raw_kf = msg -> orientation.y;
+  float param_odom = 0.01;
+
+  sys_A << 0.0, 0.0, -car_speed_kf * cos(kalman_yaw),
+           0.0, 0.0, -car_speed_kf * sin(kalman_yaw),
            0.0, 0.0, 0.0;
 
   sys_A_t = sys_A.transpose();
 
-  /************************************************************/
-  // propogate states using imu, and use the results as measurements
-  imu_ax = body_ax * sin(kalman_yaw) + body_ay * cos(kalman_yaw);
-  imu_ay = - body_ax * cos(kalman_yaw) + body_ay * sin(kalman_yaw);
-  float imu_vx_est = (kalman_x - kalman_x_last) / del_t;
-  float imu_vy_est = (kalman_y - kalman_y_last) / del_t;
-  float imu_x_est = kalman_x + imu_vx_est * del_t + 0.5 * imu_ax * del_t * del_t;
-  float imu_y_est = kalman_y + imu_vy_est * del_t + 0.5 * imu_ay * del_t * del_t;
-  float imu_yaw_est = kalman_yaw + body_yaw_rate * del_t;
-  kalman_x_last = kalman_x;
-  kalman_y_last = kalman_y;
-  /************************************************************/
+  servo_angle_kf = (1 - param_odom) * servo_angle_kf + param_odom * servo_angle_raw_kf;
+  //servo_angle_kf = 0.62 * servo_angle_raw_kf;  // 0.867
 
-  // The real prediction step using odometry      
-  kalman_x += car_speed * cos(kalman_yaw) * del_t;
-  kalman_y += car_speed * sin(kalman_yaw) * del_t;
-  kalman_yaw += car_speed * tan(servo_angle) * del_t / wheel_base;
+  float wheel_base_kf = 0.257; // in meters
+
+  float beta = atan2(wheel_base_kf*tan(servo_angle_kf)/2, wheel_base_kf);
+
+  kalman_x -= car_speed_kf * sin(kalman_yaw + beta) * del_t/cos(beta);
+  kalman_y += car_speed_kf * cos(kalman_yaw + beta) * del_t/cos(beta);
+  kalman_yaw += car_speed_kf * tan(servo_angle_kf) * del_t * cos(beta) / wheel_base_kf;
 
   state_cov_P = sys_A*state_cov_P*sys_A_t + proc_noise_Q;
+
 
   // step 2: updation
   innov = ( state_cov_P + meas_noise_R ).inverse();
@@ -392,15 +263,21 @@ void CANCallback( const sensor_msgs::Imu::ConstPtr &msg )
   kalman_y = best_estimate(1);
   kalman_yaw = best_estimate(2);
 
+  float yaw_diff = kalman_yaw - kalman_yaw_last;
+  q_rot_kf = Eigen::AngleAxisf(imu_ang_kf(0), Eigen::Vector3f::UnitX()) * Eigen::AngleAxisf(imu_ang_kf(1), Eigen::Vector3f::UnitY()) * Eigen::AngleAxisf(yaw_diff, Eigen::Vector3f::UnitZ());
+  kalman_q =  kalman_q * (q_rot_kf); 
+  kalman_yaw_last = kalman_yaw;
 
   nav_msgs::Odometry ekf;
   ekf.header.frame_id = "map";
   ekf.pose.pose.position.x = kalman_x;
   ekf.pose.pose.position.y = kalman_y;
-  ekf.pose.pose.position.z = 0.0;
-
-  q = tf::createQuaternionMsgFromRollPitchYaw(0.0, 0.0, kalman_yaw);
-  ekf.pose.pose.orientation = q;
+  ekf.pose.pose.position.z = 0;
+ 
+  ekf.pose.pose.orientation.w = kalman_q.w();
+  ekf.pose.pose.orientation.x = kalman_q.x();
+  ekf.pose.pose.orientation.y = kalman_q.y();
+  ekf.pose.pose.orientation.z = kalman_q.z();
   
   kalman_pos_pub_.publish(ekf);
   

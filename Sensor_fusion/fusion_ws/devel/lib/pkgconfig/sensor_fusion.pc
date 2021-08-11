@@ -1,0 +1,8 @@
+prefix=/home/xinkaiz/Outernet/Sensor_fusion/fusion_ws/devel
+
+Name: sensor_fusion
+Description: Description of sensor_fusion
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: message_generation roscpp rospy std_msgs tf ecl_geometry
